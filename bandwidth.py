@@ -3,10 +3,13 @@ import numpy as np
 from scipy.optimize import brentq
 import logging
 from scipy.fftpack import dct
+import matplotlib.pyplot as plt
+from scipy.integrate import dblquad
 
 
 class kde2d:
     def __init__(self, data, N):
+        # data is a 2d vector
         # Initial data for KDE
         self.n = 2 ** 8
         self.N = N  # number of the initial data
@@ -20,9 +23,9 @@ class kde2d:
         # bin the data uniformly using regular grid
         transformed_data = (data - self.MIN_XY) / np.tile(self.scaling, (self.N, 1))
         self.initial_data = self.ndhist(transformed_data, self.n)
-        a = self.dct2d(self.initial_data)
+        self.a = self.dct2d(self.initial_data)
         self.I = np.arange(0, self.n, dtype=np.float64) ** 2
-        self.A2 = a ** 2
+        self.A2 = self.a ** 2
 
     # this function computes the histogram
     # of an n-dimensional data set
@@ -49,6 +52,21 @@ class kde2d:
         w = np.vstack((np.array([1]), w1))
         weight = np.tile(w, (1, ncols))
         data = self.dct1d(self.dct1d(data, weight).T, weight).T
+        return data
+
+    def idct1d(self, x, weights, nrows, ncols):
+        y = np.fft.ifft(weights * x, axis=0).real
+        out = np.zeros([nrows, ncols])
+        idx = int(nrows / 2)
+        out[0:nrows:2, :] = y[0:idx, :]
+        out[1:nrows:2, :] = y[nrows - 1:idx - 1:-1, :]
+        return out
+
+    def idct2d(self, data):
+        [nrows, ncols] = np.shape(data)
+        w = np.array([np.exp(1j * i * np.pi / (2 * nrows)) for i in range(0, nrows)])[:, np.newaxis]
+        weights = np.tile(w, (1, ncols))
+        data = self.idct1d(self.idct1d(data, weights, nrows, ncols).T, weights, nrows, ncols)
         return data
 
     def func(self, s, t):
@@ -83,7 +101,7 @@ class kde2d:
         # now compute the optimal bandwidth^2
         try:
             # t is the bandwidth squared (used for estimating moments), calculated using fixed point
-            self.t_star = brentq(self._bandwidth_fixed_point_2D, 0, 0.2, xtol=0.01 ** 2)
+            self.t_star = brentq(self._bandwidth_fixed_point_2D, 0, 0.2, xtol=0.001 ** 2)
             # noinspection PyTypeChecker
             if fallback_t and self.t_star > 0.01 and self.t_star > 2 * fallback_t:
                 # For 2D distributions with boundaries, fixed point can overestimate significantly
@@ -102,7 +120,34 @@ class kde2d:
         p_11 = self.func([1, 1], self.t_star)
         t_x = ((p_02 ** (3 / 4)) / (4 * np.pi * self.N * (p_20 ** (3 / 4) * (p_11 + np.sqrt(p_20 * p_02))))) ** (1 / 3)
         t_y = ((p_20 ** (3 / 4)) / (4 * np.pi * self.N * (p_02 ** (3 / 4) * (p_11 + np.sqrt(p_20 * p_02))))) ** (1 / 3)
-        return np.sqrt(self.t_star) * self.scaling
+        a1 = np.array([np.exp(-(i ** 2) * (np.pi ** 2) * (t_x / 2)) for i in range(0, self.n)])[:, np.newaxis]
+        a2 = np.array([np.exp(-(i ** 2) * np.pi ** 2 * (t_y / 2)) for i in range(0, self.n)])[:, np.newaxis]
+        a2 = a2.T
+        a_t = a1.dot(a2) * self.a
+        density = self.idct2d(a_t) * np.size(self.a) / np.prod(self.scaling)
+        idx = (density < 0)
+        density[idx] = np.spacing(1)
+        x = np.linspace(self.MIN_XY[0], self.MAX_XY[0], self.n)
+        y = np.linspace(self.MIN_XY[1], self.MAX_XY[1], self.n)
+        [X, Y] = np.meshgrid(x, y)
+        # Z, err = dblquad(lambda y, x: np.exp(-2.5 * (x ** 2 - 1) ** 2 - 5 * y ** 2), -np.inf, np.inf, lambda x: -np.inf,
+        #                  lambda x: np.inf)
+        Za, _ = dblquad(lambda y, x: np.exp(-2.5 * (x ** 2 - 1) ** 2 - 5 * y ** 2), self.MIN_XY[0], self.MAX_XY[0],
+                        lambda x: self.MIN_XY[1], lambda x: self.MAX_XY[1])
+        Tpoints = np.exp(-2.5 * (X ** 2 - 1) ** 2 - 5 * Y ** 2) / Za
+        error = Tpoints - density
+        fig = plt.figure()
+        ax1 = fig.add_subplot(1, 3, 1)
+        plt.contourf(X, Y, density, cmap="RdBu_r")
+        plt.colorbar()
+        ax2 = fig.add_subplot(1, 3, 2)
+        plt.contourf(X, Y, Tpoints, cmap="RdBu_r")
+        plt.colorbar()
+        ax3 = fig.add_subplot(1, 3, 3)
+        plt.contourf(X, Y, error, cmap="RdBu_r")
+        plt.colorbar()
+        plt.show()
+        return np.sqrt([t_x, t_y]) * self.scaling
 
 
 class kde3d:
@@ -144,7 +189,8 @@ class kde3d:
             sum_func = self.func([s[0] + 1, s[1], s[2]], t) + self.func([s[0], s[1] + 1, s[2]], t) \
                        + self.func([s[0], s[1], s[2] + 1], t)
             const = (1 + 0.5 ** (sums + 1.5)) / 3
-            time = (-2 * const * self.K(s[0]) * self.K(s[1]) / self.N / sum_func) ** (1. / (2 + sums))
+            time = ((-2 * const * self.K(s[0]) * self.K(s[1]) * self.K(s[2])) / self.N / sum_func) ** (
+                    1. / (2.5 + sums))
             return self.psi(s, time)
         else:
             return self.psi(s, t)
@@ -157,15 +203,16 @@ class kde3d:
         wx = w * (self.I ** s[0])
         wy = w * (self.I ** s[1])
         wz = w * (self.I ** s[2])
-        a = 0
-        for i in range(self.n):
-            a = a + (-1) ** np.sum(s) * wz.dot(self.A2).dot(wy.T) * np.pi ** (2 * np.sum(s)) * wx[i]
+        WY, WX, WZ = np.meshgrid(wy, wx, wz)
+        W = WX * WY * WZ
+        a = (-1) ** np.sum(s) * np.sum(np.sum(W * self.A2)) * np.pi ** (2 * np.sum(s))
         return a
 
     def _bandwidth_fixed_point_3D(self, t):
-        sum_func = self.func([0, 2, 0], t) + self.func([2, 0, 0], t) + self.func([0, 0, 2], t)\
-                + 2 * self.func([1, 1, 0], t) + 2 * self.func([1, 0, 1],t) + 2 * self.func([0, 1, 1], t)
-        time = (2 * np.pi * self.N * sum_func) ** (-1. / 3)
+        sum_func = self.func([0, 2, 0], t) + self.func([2, 0, 0], t) + self.func([0, 0, 2], t) \
+                   + 2 * self.func([1, 1, 0], t) + 2 * self.func([1, 0, 1], t) + 2 * self.func([0, 1, 1], t)
+        const = (8 * np.pi ** (1.5)) / 3
+        time = (const * self.N * sum_func) ** (-2. / 7)
         return (t - time) / time
 
     # compute the optimal bandwidth
@@ -188,3 +235,4 @@ class kde3d:
             else:
                 raise
         return np.sqrt(self.t_star) * self.scaling
+
